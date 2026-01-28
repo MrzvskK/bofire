@@ -35,6 +35,21 @@ from bofire.data_models.constraints.product import (
     ProductInequalityConstraint,
 )
 
+# bofire/data_models/constraints/api.py
+from bofire.data_models.constraints.nonlinear import (
+    NonlinearConstraint,
+    filter_candidates_by_constraints,
+    get_constraint_violations,
+)
+
+__all__ = [
+    # ... existing exports ...
+    "NonlinearConstraint",
+    "filter_candidates_by_constraints",
+    "get_constraint_violations",
+]
+
+
 
 AbstractConstraint = Union[
     Constraint,
@@ -79,3 +94,5 @@ AnyCondition = Union[
 ]
 
 AnyConstraintError = Union[ConstraintError, ConstraintNotFulfilledError]
+
+
