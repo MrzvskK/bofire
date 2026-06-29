@@ -465,6 +465,60 @@ class BotorchOptimizer(AcquisitionOptimizer):
 
         return candidates
 
+    def _snap_to_equality_manifold(
+        self,
+        X: Tensor,
+        domain: Domain,
+        bounds: Tensor,
+        max_iter: int = 20,
+        lr: float = 1e-3,
+        tol: float = 1e-8,
+    ) -> Tensor:
+        """Snap near-feasible candidates onto the equality manifold.
+
+        Called after ``optimize_acqf`` returns candidates at |f(x)| ~ eq_tol + ε
+        (just outside or at the boundary of the BoTorch tolerance band).
+
+        Minimizes ``f(x)²`` directly, not the BoTorch band-violation
+        ``max(0, -c_i)²``. The band-violation loss is already zero when the
+        candidate sits exactly at the band boundary (c_i = 0), so it provides
+        no gradient and cannot move the point. Minimizing ``f(x)²`` works
+        regardless of whether the candidate is inside, at, or outside the band.
+
+        Uses a small learning rate (1e-3 vs 0.05 in IC projection) because
+        candidates are already near-feasible and a large step would overshoot.
+        """
+        from bofire.utils.torch_tools import (
+            _nonlinear_constraint_feature_indices,
+            evaluate_nonlinear_constraint_on_tensor,
+        )
+
+        eq_constraints = domain.constraints.get(NonlinearEqualityConstraint)
+        if len(eq_constraints) == 0:
+            return X
+
+        eq_info = [
+            (c, _nonlinear_constraint_feature_indices(c, domain))
+            for c in eq_constraints
+        ]
+
+        shape = X.shape
+        X_snap = X.reshape(-1, X.shape[-1]).detach().clone().requires_grad_(True)
+        opt = torch.optim.Adam([X_snap], lr=lr)
+        for _ in range(max_iter):
+            opt.zero_grad()
+            total = torch.tensor(0.0, dtype=X.dtype, device=X.device)
+            for c, feat_idx in eq_info:
+                f = evaluate_nonlinear_constraint_on_tensor(c, X_snap, feat_idx)
+                total = total + (f**2).sum()
+            if total.item() < tol:
+                break
+            total.backward()
+            opt.step()
+            with torch.no_grad():
+                X_snap.clamp_(bounds[0], bounds[1])
+        return X_snap.detach().reshape(shape)
+
     def _project_onto_nonlinear_constraints(
         self,
         X: Tensor,
@@ -647,6 +701,14 @@ class BotorchOptimizer(AcquisitionOptimizer):
 
             if nonlinear_constraints is None or len(nonlinear_constraints) == 0:
                 return candidates, acqf_vals
+
+            # Post-optimization snap: if equality constraints are present, the
+            # optimizer often returns candidates at |f(x)| = eq_tol + ε (just
+            # outside the band). A few tight-tolerance gradient steps bring
+            # |f(x)| to O(1e-9), converting these near-misses into valid candidates
+            # without changing candidate quality significantly.
+            if len(domain.constraints.get(NonlinearEqualityConstraint)) > 0:
+                candidates = self._snap_to_equality_manifold(candidates, domain, bounds)
 
             # Check feasibility in tensor space: BoTorch-style constraints are feasible when >= 0.
             X_flat = candidates.reshape(-1, candidates.shape[-1])
