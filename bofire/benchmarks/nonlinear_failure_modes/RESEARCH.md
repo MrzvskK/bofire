@@ -514,6 +514,8 @@ num_restarts = min(num_restarts, 5)  # cap for equality-constrained domains
 2. **Option B alongside** — one-line change, easy to measure in the same harness run.
 3. **Option C later** — only if A+B are insufficient or if the goal is a research publication.
 
+**Update (2026-06-29):** Option A (snap) was implemented and committed on branch `fix/post-opt-equality-snap`. Option C (AL) was prototyped — see Section 9 below.
+
 ### Harness commands for evaluation
 
 ```bash
@@ -535,3 +537,86 @@ python -m bofire.benchmarks.nonlinear_failure_modes.run \
   --seeds-range 0-4 --strategy sobo --ask-ns 1,4 --n-initial 8 \
   --out bofire/benchmarks/nonlinear_failure_modes/_runs/eval_fm2_control.jsonl
 ```
+
+---
+
+## 9. Augmented Lagrangian (Option C) — Prototype Results
+
+**Status:** Prototype implemented in `bofire/benchmarks/nonlinear_failure_modes/augmented_lagrangian.py`.
+**Experiment:** `compare_al_vs_botorch.py` — head-to-head on FM-3 circle equality (`x₀² + x₁² = 0.25`, `dim=2`, `n_restarts=5`, 5 seeds).
+
+### 9.1 Experimental setup
+
+Both methods optimise the same fitted `qLogEI` acquisition function on the same 8 seed experiments (points exactly on the circle manifold). Both use 5 restarts.
+
+- **Method A (BoTorch current):** `optimize_acqf` with the ±`eq_tol = 1e-3` slab encoding + post-opt snap (20 Adam steps at `lr=1e-3`).
+- **Method B (AL prototype):** `optimize_acqf_al` — outer loop over 8 AL iterations, inner loop of 100 LBFGS steps with strong Wolfe linesearch (box bounds only).
+
+### 9.2 Results (5 seeds: 42, 7, 13, 99, 123)
+
+| Metric | Method A (BoTorch + snap) | Method B (AL) |
+|--------|--------------------------|---------------|
+| ok_rate | 5/5 | 5/5 |
+| valid_rate (tol=1e-5) | **0/5** | **5/5** |
+| mean wall-clock | 8.05s | **2.87s** (2.8× faster) |
+| mean \|f(x*)\| | 3.29×10⁻⁵ | **3.24×10⁻⁷** (100× more precise) |
+
+Per-seed breakdown:
+
+| Seed | A elapsed | A \|f\| | A valid | B elapsed | B \|f\| | B valid |
+|------|-----------|---------|---------|-----------|---------|---------|
+| 42 | 8.19s | 2.50e-05 | FAIL | 2.90s | 2.32e-08 | **PASS** |
+| 7 | 7.98s | 2.98e-05 | FAIL | 2.59s | 4.13e-07 | **PASS** |
+| 13 | 7.94s | 6.25e-05 | FAIL | 2.07s | 2.68e-07 | **PASS** |
+| 99 | 8.02s | 2.88e-05 | FAIL | 3.42s | 2.25e-07 | **PASS** |
+| 123 | 8.10s | 1.81e-05 | FAIL | 3.36s | 6.91e-07 | **PASS** |
+
+Acqf values were comparable across both methods (within ~1–2%).
+
+### 9.3 Mechanistic explanation
+
+**Why Method A fails validation (even with snap):**
+
+The snap runs 20 Adam steps at `lr=1e-3`. This reduces `|f|` from ~1e-3 to ~2e-05, but `validate_candidates` uses `tol=1e-5`. Adam has low curvature information and doesn't converge tightly in 20 steps.
+
+**Why AL passes validation naturally:**
+
+The outer loop escalates `μ` geometrically (1 → 4 → 16 → ... → 16,384). At `μ = 16384`, the `(μ/2)f(x)²` penalty dominates the objective, forcing `|f|` toward machine precision. The inner LBFGS with strong Wolfe handles the *unconstrained* (just box-bounded) subproblem without linesearch failures.
+
+**Convergence pattern (representative restart):**
+
+```
+outer=0  mu=1e+00  |f|=8e-01  (far from manifold)
+outer=2  mu=1.6e+01 |f|=1e-01  (approaching)
+outer=4  mu=2.6e+02 |f|=3e-03  (on the scale of eq_tol)
+outer=6  mu=4.1e+03 |f|=1e-05  (within validation tolerance)
+outer=7  mu=1.6e+04 |f|=2e-07  (converged, deep precision)
+```
+
+### 9.4 Open questions for further research
+
+1. **IC diversity:** Our AL restarts use gradient-based projection from random box samples — these cluster near the same manifold basin. BoTorch's `gen_batch_initial_conditions` uses `n_raw_samples` draws with more global spread. Can we combine BoTorch's IC strategy with AL's inner loop?
+
+2. **Inequality + equality mixed domains:** Does AL generalise cleanly to mixed constraints (add inequality penalty `max(0, f(x))²`)? Initial hypothesis: yes, but need to verify on FM-1 (ball inequality) + FM-3 (circle equality) combined scenarios.
+
+3. **Acquisition regret:** In this experiment, AL found comparable or slightly better acqf values than BoTorch. But this is a single acquisition step. Over a full BO loop (20+ iterations), does AL's imprecise global search accumulate regret? Need to run the full strategy harness, not just single-ask comparisons.
+
+4. **Scaling to higher dimensions:** The 2D circle is a 1D manifold. In `dim=10` with a sphere equality, the manifold is 9D and random restarts have more coverage. Does the speedup persist?
+
+5. **LBFGS history depth:** We use default `history_size=100`. On low-dimensional problems, a smaller history may be sufficient.
+
+### 9.5 Path forward
+
+Short term (confirm viability):
+- Run full BO loop with AL strategy (not just single-ask comparison) using the harness.
+- Test on FM-3 with `dim=3, r=0.5` to check scaling.
+- Run FM-2 (ball inequality) to verify AL doesn't regress on inequality-only domains.
+
+Medium term (integration):
+- Add AL as an optional optimizer path in `acqf_optimization.py` (activate when `NonlinearEqualityConstraint` present).
+- Benchmark against BoTorch default on the full strategy harness (`n_initial=8`, 20 seeds, 5 BO iterations).
+
+Long term (research):
+- Compare AL vs. Riemannian gradient descent on the constraint manifold.
+- Investigate whether the multiplier `λ` encodes useful information about the optimal point on the manifold (dual variable = shadow price of the constraint).
+- Write up as a case study: "Why the ±tol encoding is a liability for second-order optimizers on curved equality constraints."
