@@ -620,3 +620,155 @@ Long term (research):
 - Compare AL vs. Riemannian gradient descent on the constraint manifold.
 - Investigate whether the multiplier `λ` encodes useful information about the optimal point on the manifold (dual variable = shadow price of the constraint).
 - Write up as a case study: "Why the ±tol encoding is a liability for second-order optimizers on curved equality constraints."
+
+---
+
+## 10. Mixed constraints — competing gradients analysis (2026-06-30)
+
+### 10.1 Experimental finding
+
+When AL is extended to mixed equality + inequality domains (circle equality `x₀²+x₁²=r²` plus half-plane inequality `x₀+x₁≥0`), equality convergence collapses: `|f|` stays at ~10⁻³ instead of reaching ~10⁻⁷ as in the pure equality case. All three methods (BoTorch, AL-quadratic, AL-rockafellar) fail BoFire validation on the mixed domain in the initial run.
+
+An equality-warmup fix (`eq_warmup_iters=3`: run equality-only outer iterations before activating inequality penalties) partially recovers this — AL-rockafellar reaches 2/5 valid, AL-quadratic 1/5, vs BoTorch 0/5. But the warmup is a scheduling heuristic, not a mathematical fix.
+
+### 10.2 Mathematical analysis of the competing-gradient problem
+
+At any point `x` near the circle `f(x) = x₀²+x₁²−r² = 0`:
+
+- The **equality gradient** `∇f = [2x₀, 2x₁]` points **radially outward** — normal to the manifold.
+- The **inequality gradient** for `g = −(x₀+x₁)` is `[−1, −1]` — a fixed direction.
+
+`[−1, −1]` projected onto the radial direction `[x₀, x₁]/r` gives a non-zero component: `(−x₀−x₁)/r`. That component is **normal to the circle** and directly competes with the equality gradient during inner optimization. LBFGS sees both, and neither wins cleanly.
+
+The warmup just delays the conflict. The real fix would make the inequality enforce itself **in the tangential space** of the manifold, leaving the normal direction solely for equality enforcement.
+
+### 10.3 Three mathematically principled approaches
+
+**Option 1 — Riemannian gradient projection:**
+At each inner step, after computing the full gradient `∇L`, project out the normal component before applying the step:
+
+```
+∇^R L = ∇L − (∇L · n̂) n̂,   where n̂ = ∇f / |∇f|
+```
+
+The optimizer then only moves along the manifold. Equality is enforced by a retraction step (projection back onto the manifold) after each gradient step. Inequalities enforce themselves via the tangential component of their gradient — no conflict.
+
+**Option 2 — Null-space parametrisation:**
+Reparametrise `x` as a point on the manifold using local coordinates. For the circle, this is simply `x(θ) = [r·cos θ, r·sin θ]` — the optimisation becomes unconstrained in `θ`, and inequalities are handled as box constraints on `θ`. The equality is exact by construction. Generalises to higher dimensions via a local basis for the null space of `∇f^T`.
+
+**Option 3 — ADMM / operator splitting:**
+Split into two alternating subproblems — one handles only equality (project to manifold), one handles only inequality and acquisition (optimise along manifold). No competing gradients because they are never in the same objective.
+
+### 10.4 Connection to original research direction
+
+This is exactly what RESEARCH.md Section 7 flagged as the deep fix: *"acquisition function optimisation that explicitly moves along the constraint manifold (Riemannian gradient descent)"*. The AL mixed-constraint experiment exposed the problem concretely — the competing normal gradient is measurable, reproducible, and mathematically characterisable.
+
+### 10.5 Next implementation steps
+
+Prototype **Option 2 (null-space parametrisation)** first — it is the cleanest for the circle/sphere case and reduces to a 1D unconstrained problem, giving a sharp test of whether manifold-awareness eliminates the competing-gradient failure.
+
+Then prototype **Option 1 (Riemannian gradient projection)** — it generalises to arbitrary smooth equality manifolds without needing an explicit parametrisation, making it the most promising path for integration into `acqf_optimization.py`.
+
+Option 3 (ADMM) remains a fallback if both 1 and 2 show convergence issues on non-convex acquisition landscapes.
+
+---
+
+## 11. Manifold-aware optimisers — experimental results (2026-06-30)
+
+### 11.1 Implementation
+
+Two new methods implemented in
+`bofire/benchmarks/nonlinear_failure_modes/manifold_optimizer.py`:
+
+**`optimize_acqf_null_space_sphere`** (Option 2 — θ parametrisation):
+- For equality `x₀²+x₁²+…=r²` reparametrise as `x(θ)=[r·cos θ, r·sin θ]`.
+- Optimise over `θ ∈ ℝ` with Adam, applying inequality penalties in θ-space.
+- Equality is exact by construction (no retraction, no multiplier). The equality
+  gradient literally does not exist in the optimisation problem.
+
+**`optimize_acqf_riemannian`** (Option 1 — gradient projection + retraction):
+- General manifold approach for any smooth `f(x)=0`.
+- At each step: project the acquisition+inequality gradient onto the tangent space
+  of `f` (null space of `∇f ᵀ`), then update `x` in the projected direction.
+- Periodically retract back onto the manifold by minimising `f(x)²` with LBFGS.
+- No equality term in the objective — only inequalities.
+
+### 11.2 Results on pure equality (circle, no inequality)
+
+| Method | `|eq|` mean | Valid 5/5 |
+|--------|------------|-----------|
+| θ parametrisation | **5.5e-18** | ✓ |
+| Riemannian GD | 2.2e-7 | ✓ |
+| AL (Section 9) | ~1e-7 | ✓ |
+
+All three methods work on the pure equality case. θ achieves floating-point
+machine epsilon; Riemannian is ~2e-7 after LBFGS retraction.
+
+### 11.3 Results on mixed domain (circle equality + half-plane inequality)
+
+Setting: `x₀²+x₁²=0.25` plus `−x₀−x₁ ≤ 0` (i.e. `x₀+x₁ ≥ 0`).
+Tolerance: eq < 1e-5 AND ineq < 1e-4. 5 seeds, 8 restarts, seed data n=8.
+
+| Method | Valid | `|eq|` mean | ineq mean | acqf (valid) |
+|--------|-------|------------|-----------|--------------|
+| **θ parametrisation** | **5/5** | **5.5e-18** | **0** | −10.47 |
+| Riemannian GD | 4/5 | 1.4e-8 | 7.4e-4 | −11.53 |
+| AL-Rockafellar+warmup (Section 10) | **5/5** | 1.8e-6 | 1.3e-6 | **−5.32** |
+
+### 11.4 Key findings
+
+**1. θ parametrisation completely eliminates competing gradients.**
+The circle equality is encoded into the parametrisation, not as a penalty term.
+At every iterate, `f(x(θ)) = 0` exactly by construction. Inequality penalties
+operate purely in θ-space and never corrupt the normal direction of the manifold.
+Result: machine-epsilon equality (5.5e-18), zero inequality violation, 5/5 valid.
+
+**2. Riemannian gradient projection partially solves the problem.**
+Projecting the gradient onto the tangent space removes the radial component,
+so the equality retraction is not disrupted. Equality precision is 1.4e-8 —
+excellent. But one seed (seed=3) fails with ineq=3.7e-3.
+
+The Riemannian failure has an exact mathematical cause: the inequality gradient
+`∇g = [−1, −1]` is projected onto the tangent space of the circle, giving
+`∇g_tangent = [−1, −1] − ((−1·x₀ − 1·x₁)/r²)[x₀, x₁]`.
+At the point `(−r/√2, −r/√2)` (most infeasible corner), the tangent is `[1, −1]/√2`,
+and `∇g_tangent · tangent = (−1+1)/√2 = 0` — the inequality penalty has **zero
+tangential gradient** at the hardest corner. The optimizer stalls there.
+
+**3. AL finds better acquisition values than θ.**
+AL-Rockafellar achieves acqf = −5.32 (mean) vs θ's −10.47. The multiplier
+dynamics of AL may provide implicit exploration that the pure angular parametrisation
+lacks: AL searches over the full x-space while θ is confined to a 1D search.
+
+**4. Precision vs. exploration trade-off.**
+θ is maximally precise (machine epsilon) but may get stuck: the 1D θ-space has
+a simple landscape but limited restarts coverage. AL searches in 2D (full space)
+with higher variance but finds better optima. Riemannian inherits this tension.
+
+### 11.5 Implications for integration
+
+For pure equality constraints (no inequality):
+→ **θ / Riemannian** are the natural choice. Both are faster and more precise than AL.
+
+For mixed equality + inequality:
+→ **θ dominates** on validity (5/5, machine epsilon) but may miss good acquisition
+   values if the feasible arc is complex or the acquisition landscape is multimodal.
+→ **AL** is a pragmatic fallback: less precise (1.8e-6) but finds better acqf values.
+
+A hybrid strategy would combine both:
+1. Run Riemannian / θ for tight constraint satisfaction.
+2. Use AL as a tiebreaker when the θ search stalls in a low-acqf region.
+
+### 11.6 Next steps
+
+1. **Improve θ exploration**: increase restarts, add momentum or simulated annealing
+   in θ-space, or use LBFGS over θ (exact gradient via chain rule is available).
+2. **Fix Riemannian ineq stalling**: when `|∇g_tangent|` is small, take a larger
+   retraction step toward the feasible side, or add a fallback inequality penalty
+   only when the tangential component is below a threshold.
+3. **Hybrid θ+AL**: run both in parallel, return the candidate with better acqf
+   value among those satisfying all constraints.
+4. **Generalise θ to ellipsoids**: `Σᵢ aᵢxᵢ² = c` admits the same reparametrisation
+   with scaled coordinates — covers many real experimental constraints.
+5. **Extend to multiple equalities** (`codim > 1`): use a local frame (QR of Jacobian)
+   to reduce to an `(n − k)`-dimensional unconstrained problem.
